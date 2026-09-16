@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Prospecção ACAPS Trade Show 2026 · Sankhya</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <style>
 :root{
   --ink:#15241E; --canvas:#EEF2F0; --surface:#FFFFFF; --surface-2:#F7FAF8;
@@ -198,8 +199,8 @@ select.sol{border:1px solid var(--line);border-radius:8px;padding:8px 10px;flex:
     <span id="statusSalvo" class="sav">pronto</span>
     <span id="statusSync" class="sav" style="display:none"></span>
     <button class="toolbtn" id="btnExport">Baixar dados</button>
-    <button class="toolbtn" id="btnImport">Carregar dados</button>
-    <input type="file" id="fileIn" accept=".json" hidden>
+    <button class="toolbtn" id="btnImport" title="Une os arquivos dos executivos sem apagar nada">Consolidar arquivos</button>
+    <input type="file" id="fileIn" accept=".json" multiple hidden>
   </div>
   <div id="faixa" role="alert"></div>
   <nav id="nav"></nav>
@@ -453,25 +454,37 @@ function pintarStatus(){
 }
 
 /* ============================================================
-   SINCRONIZAÇÃO COM A PLANILHA GOOGLE
+   SINCRONIZAÇÃO EM TEMPO REAL (SUPABASE)
    ------------------------------------------------------------
-   Cole entre as aspas abaixo o endereço do "app da web" gerado
-   pelo Apps Script (termina em /exec). Enquanto estiver vazio, a
-   página funciona normalmente, só sem gravar na nuvem.
+   Preencha as duas linhas abaixo com os dados do seu projeto.
+   No painel do Supabase: Project Settings → API.
+     SUPA_URL_FIXA = Project URL   (https://xxxxx.supabase.co)
+     SUPA_KEY_FIXA = chave anon / publishable  (NUNCA a service_role)
+   Antes disso, rode o supabase.sql no SQL Editor do projeto.
+   Enquanto estiver em branco, a página funciona só neste aparelho.
    ============================================================ */
-const SYNC_FIXA = "https://script.google.com/macros/s/AKfycbzRkEvKCyZQBL342oxyksvv6cbI627RJLcS3zwLvPaM2ijRGqwhkMy5puNu1xOVZgiw/exec";
+const SUPA_URL_FIXA = "https://aeqfcxnmjgponjalnqig.supabase.co";
+const SUPA_KEY_FIXA = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFlcWZjeG5tamdwb25qYWxucWlnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1ODY0MjAsImV4cCI6MjEwNTE2MjQyMH0.mx_-97djtDSxb0lsZMPhGOURGzvgLxDoaQtSAbTw9l0";
 
-/* Endereço em uso: o fixo acima ou um configurado pelo botão "Testar
-   conexão", que fica guardado só neste aparelho. */
-let SYNC_URL = SYNC_FIXA;
-try{ SYNC_URL = SYNC_FIXA || localStorage.getItem(KEY + ".url") || ""; }catch(e){}
+let SUPA_URL = SUPA_URL_FIXA, SUPA_KEY = SUPA_KEY_FIXA;
+try{
+  SUPA_URL = SUPA_URL_FIXA || localStorage.getItem(KEY + ".url") || "";
+  SUPA_KEY = SUPA_KEY_FIXA || localStorage.getItem(KEY + ".key") || "";
+}catch(e){}
 
+const TABELA = "interacoes";
 const KEY_FILA = KEY + ".fila";
-let fila = [];              // eventos ainda não confirmados pelo servidor
-let enviando = false;
-let puxando = false;
-let syncEstado = SYNC_URL ? "ok" : "off";
-let tentativas = {};
+
+let fila = [];              // lançamentos ainda não confirmados pelo servidor
+let eventos = [];           // log já confirmado, vindo do servidor
+let idsVistos = new Set();
+let ultimoTs = 0;
+let enviando = false, puxando = false;
+let syncEstado = "off", erroSync = "";
+let tempoReal = false, canal = null;
+let pendenteRender = false;
+
+function ligado(){ return !!(SUPA_URL && SUPA_KEY); }
 
 function carregarFila(){
   try{ const r = localStorage.getItem(KEY_FILA); fila = r ? JSON.parse(r) : []; }
@@ -488,9 +501,26 @@ function carimbo(ts){
          d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"});
 }
 
-/* Toda alteração vira uma linha nova no log. Nada é sobrescrito. */
+function cab(extra){
+  return Object.assign({
+    "apikey": SUPA_KEY,
+    "Authorization": "Bearer " + SUPA_KEY,
+    "Content-Type": "application/json"
+  }, extra || {});
+}
+function paraBanco(e){
+  return {id:e.id, ts:e.ts, exec:e.exec||"", empresa_id:e.empresaId||"", empresa:e.empresa||"",
+          porte:e.porte||"", tipo:e.tipo||"", valor:e.valor==null?"":String(e.valor), quando:e.quando||""};
+}
+function doBanco(r){
+  return {id:r.id, ts:Number(r.ts), exec:r.exec||"", empresaId:r.empresa_id||"", empresa:r.empresa||"",
+          porte:r.porte||"", tipo:r.tipo||"", valor:r.valor==null?"":String(r.valor), quando:r.quando||""};
+}
+
+/* Toda alteração vira uma linha nova. A tabela não aceita alteração nem
+   exclusão, então ninguém consegue apagar o registro de outra pessoa. */
 function registrar(tipo, emp, valor, extra){
-  if(!SYNC_URL) return;
+  if(!ligado()) return;
   fila.push(Object.assign({
     id: novoId(), ts: Date.now(),
     exec: emp ? emp.exec : "", empresaId: emp ? emp.id : "",
@@ -500,67 +530,114 @@ function registrar(tipo, emp, valor, extra){
   salvarFila(); pintarSync(); enviar();
 }
 
-/* Leitura via JSONP: atravessa qualquer restrição de CORS do Apps Script. */
-function jsonp(params, msLimite){
-  return new Promise((res, rej)=>{
-    const cb = "cb" + novoId();
-    const s = document.createElement("script");
-    const t = setTimeout(()=>{ limpar(); rej(new Error("tempo esgotado")); }, msLimite || 20000);
-    function limpar(){ clearTimeout(t); try{ delete window[cb]; }catch(_){ window[cb]=undefined; } s.remove(); }
-    window[cb] = d => { limpar(); res(d); };
-    s.onerror = ()=>{ limpar(); rej(new Error("falha de rede")); };
-    s.src = SYNC_URL + "?callback=" + cb + "&" +
-      Object.entries(params).map(([k,v])=>encodeURIComponent(k)+"="+encodeURIComponent(v)).join("&");
-    document.body.appendChild(s);
-  });
-}
-
 function enviar(){
-  if(!SYNC_URL || enviando || !fila.length) return;
+  if(!ligado() || enviando || !fila.length) return;
   if(typeof navigator !== "undefined" && navigator.onLine === false){
     syncEstado = "offline"; pintarSync(); return;
   }
   enviando = true; syncEstado = "enviando"; pintarSync();
-  const lote = fila.slice(0, 25);
-  let houveFalha = false;
+  const lote = fila.slice(0, 50);
 
-  /* O POST grava; o JSONP seguinte confirma o que realmente chegou.
-     Só sai da fila o evento confirmado pelo servidor. */
-  fetch(SYNC_URL, {
-    method:"POST", mode:"no-cors",
-    headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body: JSON.stringify({acao:"log", eventos:lote})
-  })
-  .catch(()=>{})
-  .then(()=> jsonp({acao:"ids", ids: lote.map(e=>e.id).join(",")}))
-  .then(r=>{
-    const conf = new Set((r && r.confirmados) || []);
-    lote.forEach(e=>{ if(!conf.has(e.id)) tentativas[e.id] = (tentativas[e.id]||0) + 1; });
-    fila = fila.filter(e=>!conf.has(e.id));
+  fetch(SUPA_URL + "/rest/v1/" + TABELA + "?on_conflict=id", {
+    method: "POST",
+    headers: cab({"Prefer": "resolution=ignore-duplicates,return=minimal"}),
+    body: JSON.stringify(lote.map(paraBanco))
+  }).then(r=>{
+    if(!r.ok) return r.text().then(t=>{ throw new Error(r.status + " " + String(t).slice(0,180)); });
+    const ids = new Set(lote.map(e=>e.id));
+    fila = fila.filter(e=>!ids.has(e.id));
     salvarFila();
-    syncEstado = fila.length ? "pendente" : "ok";
-    houveFalha = conf.size === 0;
-    /* Se o POST não estiver passando nesta rede, grava um a um pelo JSONP. */
-    const teimoso = fila.find(e=>(tentativas[e.id]||0) >= 2 && JSON.stringify(e).length < 1200);
-    if(teimoso) return jsonp({acao:"grava", ev: JSON.stringify(teimoso)}).then(rr=>{
-      if(rr && rr.ok){ fila = fila.filter(e=>e.id!==teimoso.id); salvarFila(); houveFalha = false; }
-    });
-  })
-  .catch(()=>{ syncEstado = "erro"; houveFalha = true; })
-  .then(()=>{
+    lote.forEach(e=>{ if(!idsVistos.has(e.id)){ idsVistos.add(e.id); eventos.push(e); if(e.ts > ultimoTs) ultimoTs = e.ts; } });
+    syncEstado = fila.length ? "pendente" : "ok"; erroSync = "";
+  }).catch(err=>{
+    syncEstado = "erro"; erroSync = String(err && err.message || err);
+  }).then(()=>{
     enviando = false; pintarSync();
-    /* Só recua o intervalo quando deu errado. Dando certo, escoa a fila
-       imediatamente, senão os lançamentos chegam em conta-gotas. */
-    if(fila.length) setTimeout(enviar, houveFalha ? 10000 : 300);
+    if(fila.length) setTimeout(enviar, syncEstado === "erro" ? 8000 : 300);
   });
 }
 
-/* Reconstrói o estado inteiro a partir do log. Como o log é só de
-   acréscimo, isso é sempre reproduzível e nunca destrói registro alheio. */
-function projetar(eventos){
+/* Busca o que entrou desde a última consulta. É o que mantém os cinco
+   aparelhos olhando para a mesma informação. */
+function puxar(){
+  if(!ligado() || puxando) return Promise.resolve(0);
+  puxando = true;
+  const q = SUPA_URL + "/rest/v1/" + TABELA + "?select=*&order=ts.asc&limit=1000"
+          + (ultimoTs ? "&ts=gte." + ultimoTs : "");
+  return fetch(q, {headers: cab()})
+    .then(r=>{
+      if(!r.ok) return r.text().then(t=>{ throw new Error(r.status + " " + String(t).slice(0,180)); });
+      return r.json();
+    })
+    .then(linhas=>{
+      let novos = 0;
+      (linhas || []).forEach(l=>{
+        const e = doBanco(l);
+        if(!idsVistos.has(e.id)){ idsVistos.add(e.id); eventos.push(e); novos++; }
+        if(e.ts > ultimoTs) ultimoTs = e.ts;
+      });
+      if(novos) aplicar();
+      syncEstado = fila.length ? "pendente" : "ok";
+      erroSync = "";
+      /* Página cheia: provavelmente há mais para trazer. */
+      if((linhas || []).length >= 1000) setTimeout(puxar, 200);
+      return novos;
+    })
+    .catch(err=>{ syncEstado = "erro"; erroSync = String(err && err.message || err); return 0; })
+    .then(n=>{ puxando = false; pintarSync(); return n; });
+}
+
+/* Reconstrói a tela a partir do log. Se a pessoa estiver digitando ou com
+   uma empresa aberta, espera — ninguém perde o que está escrevendo. */
+function aplicar(){
+  const a = typeof document !== "undefined" ? document.activeElement : null;
+  const ocupado = abertoId || (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  if(ocupado){ pendenteRender = true; return; }
+  pendenteRender = false;
+  state = projetar(eventos.concat(fila));
+  salvar(); renderNav(); renderMain();
+}
+
+/* Empurrão do servidor: chega em menos de um segundo, sem esperar a
+   próxima consulta. Se a biblioteca não carregar, a consulta periódica
+   continua dando conta sozinha. */
+function ligarTempoReal(){
+  if(!ligado() || canal) return;
+  const lib = typeof window !== "undefined" ? window.supabase : null;
+  if(!lib || !lib.createClient) return;
+  try{
+    const cli = lib.createClient(SUPA_URL, SUPA_KEY);
+    canal = cli.channel("acaps2026")
+      .on("postgres_changes", {event:"INSERT", schema:"public", table:TABELA}, msg=>{
+        const e = doBanco(msg.new || {});
+        if(!e.id || idsVistos.has(e.id)) return;
+        idsVistos.add(e.id); eventos.push(e);
+        if(e.ts > ultimoTs) ultimoTs = e.ts;
+        aplicar();
+      })
+      .subscribe(st=>{ tempoReal = (st === "SUBSCRIBED"); pintarSync(); });
+  }catch(e){ canal = null; tempoReal = false; }
+}
+
+function reiniciarSync(){
+  eventos = []; idsVistos = new Set(); ultimoTs = 0;
+  canal = null; tempoReal = false;
+  enviarHistorico();
+  ligarTempoReal();
+  return puxar();
+}
+
+/* Recarrega o log inteiro do zero. */
+function consolidar(silencioso){
+  if(!ligado()) return Promise.resolve();
+  eventos = []; idsVistos = new Set(); ultimoTs = 0;
+  return puxar().then(n=>{ if(!silencioso) toast(eventos.length + " interações carregadas"); });
+}
+
+function projetar(lista){
   const emp = baseInicial();
   const porId = {}; emp.forEach(e=>porId[e.id] = e);
-  eventos.slice().sort((a,b)=>a.ts - b.ts).forEach(ev=>{
+  lista.slice().sort((a,b)=>a.ts - b.ts).forEach(ev=>{
     if(ev.tipo === "empresa+"){
       if(!porId[ev.empresaId]){
         let n; try{ n = JSON.parse(ev.valor); }catch(_){ return; }
@@ -586,70 +663,128 @@ function projetar(eventos){
   return {empresas: emp};
 }
 
-function consolidar(silencioso){
-  if(!SYNC_URL || puxando) return Promise.resolve();
-  puxando = true; pintarSync();
-  return jsonp({acao:"tudo"}).then(r=>{
-    if(!r || !Array.isArray(r.eventos)) throw new Error("resposta inesperada");
-    state = projetar(r.eventos.concat(fila));
-    salvar(); renderNav(); renderMain();
-    if(!silencioso) toast(r.eventos.length + " interações carregadas do servidor");
-  }).catch(()=>{
-    if(!silencioso) toast("Não consegui consolidar agora. A conexão pode estar instável.");
-  }).then(()=>{ puxando = false; pintarSync(); });
+/* Sobe o que já estava lançado no aparelho antes de a sincronização
+   existir. Identificadores derivados do conteúdo: repetir não duplica. */
+function idFixo(){
+  return Array.prototype.join.call(arguments, "~").replace(/\s+/g, "_").slice(0, 120);
+}
+function enviarHistorico(){
+  if(!ligado()) return 0;
+  const naFila = new Set(fila.map(e=>e.id));
+  const agora = Date.now();
+  let novos = 0;
+  const por = (e, id, ts, tipo, valor, extra)=>{
+    if(naFila.has(id) || idsVistos.has(id)) return;
+    naFila.add(id); novos++;
+    fila.push(Object.assign({
+      id, ts, exec:e.exec, empresaId:e.id, empresa:e.nome, porte:e.porte,
+      tipo, valor: String(valor)
+    }, extra || {}));
+  };
+  state.empresas.forEach(e=>{
+    (e.followups || []).forEach(f=>
+      por(e, idFixo(e.id,"fu",f.ts), f.ts, "followup", f.txt, {quando:f.quando}));
+    (e.solucoes || []).forEach(s=>
+      por(e, idFixo(e.id,"sol",s), agora, "solucao+", s));
+    if(e.visitado) por(e, idFixo(e.id,"vis","inicial"), agora, "visita", "1");
+  });
+  if(novos){ salvarFila(); pintarSync(); enviar(); }
+  return novos;
 }
 
-/* Diagnóstico: valida o endereço, consulta o servidor e traduz a falha
-   em algo acionável, em vez de deixar o indicador preso em "erro". */
-function diagnosticar(url){
-  const alvo = (url || "").trim();
-  if(!alvo) return Promise.resolve({ok:false, msg:"Cole o endereço do app da web gerado pelo Apps Script."});
-  if(!/^https:\/\/script\.google(usercontent)?\.com\/.+/.test(alvo))
-    return Promise.resolve({ok:false, msg:"Esse endereço não parece ser do Apps Script. Ele começa com https://script.google.com/ e termina em /exec."});
-  if(!/\/exec\/?$/.test(alvo))
-    return Promise.resolve({ok:false, msg:alvo.indexOf("/dev") > -1
-      ? "Você copiou o endereço de teste (/dev), que só funciona logado na sua conta. Use Implantar → Nova implantação e copie o que termina em /exec."
-      : "O endereço precisa terminar em /exec. Copie o link mostrado após Implantar → Nova implantação."});
+/* Diagnóstico: traduz a falha em algo acionável. */
+function diagnosticar(url, key){
+  url = (url || "").trim().replace(/\/+$/, "");
+  key = (key || "").trim();
+  if(!url || !key) return Promise.resolve({ok:false, msg:"Preencha o endereço do projeto e a chave."});
+  if(!/^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/i.test(url))
+    return Promise.resolve({ok:false, msg:"O endereço do projeto é só o Project URL, no formato https://xxxxxxxx.supabase.co — sem barra no fim e sem /rest/v1."});
+  if(/^sb_secret_/.test(key) || /service_role/.test(key))
+    return Promise.resolve({ok:false, msg:"Essa é a chave secreta (service_role). Ela dá acesso total ao banco e NÃO pode ficar numa página publicada. Use a chave anon (publishable)."});
+  if(!/^(eyJ|sb_publishable_)/.test(key))
+    return Promise.resolve({ok:false, msg:"Isso não parece uma chave de API do Supabase. Em Project Settings → API, copie a chave anon / publishable inteira."});
 
-  const antes = SYNC_URL; SYNC_URL = alvo;
-  return jsonp({acao:"ping"}, 20000).then(r=>{
-    if(r && r.ok) return {ok:true, msg:"Conexão funcionando. A planilha já tem " + (r.interacoes||0) + " interação(ões) registrada(s)."};
-    SYNC_URL = antes;
-    return {ok:false, msg:"O servidor respondeu, mas recusou o pedido: " + ((r&&r.erro) || "motivo não informado") + "."};
-  }).catch(()=>{
-    SYNC_URL = antes;
-    return {ok:false, msg:"Sem resposta do servidor. Na maioria das vezes é a permissão da implantação: abra Implantar → Gerenciar implantações, clique no lápis e confirme que \"Quem pode acessar\" está como \"Qualquer pessoa\". Se você acabou de alterar o script, publique uma Nova versão."};
-  });
+  return fetch(url + "/rest/v1/" + TABELA + "?select=id&limit=1", {
+    headers: {"apikey":key, "Authorization":"Bearer "+key, "Prefer":"count=exact"}
+  }).then(r=>{
+    if(r.ok){
+      const cr = r.headers && r.headers.get ? r.headers.get("content-range") : null;
+      const tot = cr && cr.indexOf("/") > -1 ? cr.split("/")[1] : "?";
+      return {ok:true, msg:"Conexão funcionando. A tabela já tem " + tot + " interação(ões) registrada(s)."};
+    }
+    if(r.status === 401 || r.status === 403)
+      return {ok:false, msg:"Chave recusada ou permissões ausentes. Confirme que copiou a chave anon inteira e que rodou o supabase.sql, que cria as políticas de leitura e gravação."};
+    if(r.status === 404)
+      return {ok:false, msg:"A tabela " + TABELA + " não existe neste projeto. Abra o SQL Editor do Supabase e rode o conteúdo do supabase.sql."};
+    return r.text().then(t=>({ok:false, msg:"O servidor respondeu " + r.status + ": " + String(t).slice(0,180)}));
+  }).catch(()=>({ok:false, msg:"Não consegui falar com o projeto. Confira o endereço e se o projeto não está pausado por inatividade no painel do Supabase."}));
 }
 
 function abrirTeste(){
-  const atual = SYNC_URL || "";
-  const url = prompt("Cole aqui o endereço do app da web do Apps Script (termina em /exec):", atual);
+  const url = prompt("Project URL do Supabase (https://xxxxxxxx.supabase.co):", SUPA_URL || "");
   if(url === null) return;
+  const key = prompt("Chave anon / publishable do projeto:", SUPA_KEY || "");
+  if(key === null) return;
   toast("Testando a conexão…");
-  diagnosticar(url).then(r=>{
+  diagnosticar(url, key).then(r=>{
     if(r.ok){
-      try{ localStorage.setItem(KEY + ".url", url.trim()); }catch(e){}
-      SYNC_URL = url.trim();
+      SUPA_URL = url.trim().replace(/\/+$/, ""); SUPA_KEY = key.trim();
+      try{
+        localStorage.setItem(KEY + ".url", SUPA_URL);
+        localStorage.setItem(KEY + ".key", SUPA_KEY);
+      }catch(e){}
       syncEstado = fila.length ? "pendente" : "ok";
-      pintarSync(); renderMain(); enviar();
+      reiniciarSync(); pintarSync(); renderMain();
     }
     alert(r.msg);
   });
 }
 
+/* Une um arquivo baixado ao que já existe, sem apagar nada.
+   Continua útil como reserva caso a rede do pavilhão caia de vez. */
+function mesclar(entrada){
+  let novosFu = 0, novasSol = 0, novasEmp = 0, novasVis = 0;
+  const porId = {}, porNome = {};
+  state.empresas.forEach(e=>{ porId[e.id] = e; porNome[(e.nome||"").toUpperCase()] = e; });
+
+  (entrada.empresas || []).forEach(v=>{
+    let e = porId[v.id] || porNome[(v.nome||"").toUpperCase()];
+    if(!e){
+      e = Object.assign({}, v, {followups:[], solucoes:[], visitado:false});
+      state.empresas.push(e); porId[e.id] = e; porNome[(e.nome||"").toUpperCase()] = e;
+      novasEmp++;
+    }
+    if(v.visitado && !e.visitado){ e.visitado = true; novasVis++; }
+    (v.followups || []).forEach(f=>{
+      if(!e.followups.some(x=>String(x.ts) === String(f.ts) || x.txt === f.txt)){
+        e.followups.push(f); novosFu++;
+      }
+    });
+    e.followups.sort((a,b)=>a.ts - b.ts);
+    (v.solucoes || []).forEach(s=>{
+      if(!e.solucoes.includes(s)){ e.solucoes.push(s); novasSol++; }
+    });
+  });
+  return {novosFu, novasSol, novasEmp, novasVis};
+}
+
 function pintarSync(){
   const el = document.getElementById("statusSync"); if(!el) return;
+  el.style.display = ligado() ? "flex" : "none";
+  if(!ligado()){ el.textContent = ""; return; }
+  if(puxando && !eventos.length){ el.textContent = "carregando…"; el.className = "sav"; return; }
   const txt = {
-    off:"sem sincronização", ok:"sincronizado", enviando:"enviando…",
-    pendente: fila.length + " pendente" + (fila.length>1?"s":""),
-    offline:"sem conexão", erro:"falha ao sincronizar"
+    ok: tempoReal ? "tempo real" : "sincronizado",
+    enviando: "enviando…",
+    pendente: fila.length + " pendente" + (fila.length > 1 ? "s" : ""),
+    offline: "sem conexão",
+    erro: "falha ao sincronizar"
   };
-  if(puxando){ el.textContent = "consolidando…"; el.className = "sav"; return; }
   el.textContent = txt[syncEstado] || "";
+  el.title = erroSync || "";
   el.className = "sav" + (["offline","erro","pendente"].includes(syncEstado) ? " ruim" : "");
-  el.style.display = SYNC_URL ? "flex" : "none";
 }
+
 window.addEventListener("storage", ev=>{
   if(ev.key !== KEY || !ev.newValue || abertoId) return;
   try{
@@ -717,19 +852,7 @@ function renderNav(){
     return `<button role="tab" aria-selected="${aba===a.id}" data-t="${a.id}">${esc(a.rot)}${c}</button>`;
   }).join("");
   $("#nav").querySelectorAll("button").forEach(b=>
-    b.onclick=()=>{ aba=b.dataset.t; carregarFila();
-render();
-pintarSync();
-
-enviar();
-setInterval(enviar, 15000);
-/* A gestora vê o consolidado se atualizando sozinho enquanto fica na aba dela. */
-setInterval(()=>{ if(SYNC_URL && aba==="gestao" && !abertoId) consolidar(true); }, 60000);
-window.addEventListener("online", enviar);
-window.addEventListener("offline", ()=>{ if(SYNC_URL){ syncEstado="offline"; pintarSync(); } });
-window.addEventListener("beforeunload", ev=>{
-  if(fila.length){ ev.preventDefault(); ev.returnValue = ""; }
-}); window.scrollTo({top:0}); });
+    b.onclick=()=>{ aba=b.dataset.t; render(); window.scrollTo({top:0}); });
 }
 
 function render(){ renderNav(); renderMain(); salvar(); }
@@ -743,7 +866,14 @@ function renderMain(){
     if(bt) bt.onclick = abrirTeste;
   }
   else if(aba==="cadastro"){ $("#main").innerHTML = viewCadastro(); ligarCadastro(); }
-  else { $("#main").innerHTML = viewExec(aba.slice(3)); }
+  else {
+    $("#main").innerHTML = viewExec(aba.slice(3));
+    const bh = document.getElementById("btnHist");
+    if(bh) bh.onclick = ()=>{
+      const n = enviarHistorico();
+      toast(n ? n + " lançamento(s) enviado(s) ao servidor" : "Tudo já estava sincronizado");
+    };
+  }
   ligarTabelas();
   ligarFiltros();
 }
@@ -789,10 +919,10 @@ function viewGestao(){
     <h2>Cobertura do evento</h2>
     <p class="lede">Atualiza a cada visita e follow-up registrado pelos executivos.</p>
     <div class="row" style="margin:-6px 0 16px">
-      ${SYNC_URL ? `<button class="btn sm ghost" id="btnConsolidar">Consolidar do servidor</button>` : ""}
+      ${ligado() ? `<button class="btn sm ghost" id="btnConsolidar">Consolidar do servidor</button>` : ""}
       <button class="btn sm ghost" id="btnTestar">Testar conexão</button>
-      <span style="color:var(--muted);font-size:12.5px">${SYNC_URL
-        ? "Traz os lançamentos de todos os executivos."
+      <span style="color:var(--muted);font-size:12.5px">${ligado()
+        ? "Todos os executivos alimentam esta mesma visão."
         : "Sincronização ainda não configurada — os dados ficam só neste aparelho."}</span>
     </div>
 
@@ -946,6 +1076,11 @@ function viewExec(nome){
           ${PORTES[o.p]} · ${o.vis}/${o.tot} (${o.pc}%)</span>`).join("")}
       </div>
     </section>
+
+    ${ligado() ? `<div class="row" style="margin:-4px 0 16px">
+      <button class="btn sm ghost" id="btnHist">Enviar meus lançamentos ao servidor</button>
+      <span style="color:var(--muted);font-size:12.5px">Use se você lançou algo antes da sincronização entrar no ar.</span>
+    </div>` : ""}
 
     <section class="kpis">
       <div class="kpi"><b>${meus.length-vis.length}</b><small>Faltam visitar</small></div>
@@ -1162,6 +1297,7 @@ function fechar(){
   $("#veil").classList.remove("on");
   document.body.style.overflow="";
   abertoId = null;
+  if(pendenteRender) aplicar();
 }
 
 function ligarModal(e, gestor){
@@ -1269,23 +1405,59 @@ $("#btnExport").onclick = ()=>{
 };
 $("#btnImport").onclick = ()=>$("#fileIn").click();
 $("#fileIn").onchange = ev=>{
-  const f = ev.target.files[0]; if(!f) return;
-  const r = new FileReader();
-  r.onload = () => {
-    try{
-      const d = JSON.parse(r.result);
-      if(!d || !Array.isArray(d.empresas) || !d.empresas.length) throw 0;
-      const reg = state.empresas.reduce((s,e)=>s+e.followups.length+e.solucoes.length,0);
-      if(reg && !confirm(`Esta tela já tem ${reg} registro(s) de campo. Carregar o arquivo substitui tudo pelo conteúdo dele. Continuar?`)){
-        ev.target.value = ""; return;
-      }
-      state = d; render(); toast("Dados carregados");
-    }catch(_){ toast("Arquivo inválido. Use um JSON baixado por esta página."); }
+  const arquivos = [...ev.target.files]; if(!arquivos.length) return;
+  Promise.all(arquivos.map(f=>new Promise(res=>{
+    const r = new FileReader();
+    r.onload = ()=>{ try{ res(JSON.parse(r.result)); }catch(_){ res(null); } };
+    r.onerror = ()=>res(null);
+    r.readAsText(f);
+  }))).then(lidos=>{
+    let fu=0, sol=0, emp=0, vis=0, bons=0, ruins=0;
+    lidos.forEach(d=>{
+      if(!d || !Array.isArray(d.empresas) || !d.empresas.length){ ruins++; return; }
+      const r = mesclar(d);
+      fu+=r.novosFu; sol+=r.novasSol; emp+=r.novasEmp; vis+=r.novasVis; bons++;
+    });
     ev.target.value = "";
-  };
-  r.readAsText(f);
+    if(!bons){ toast("Nenhum arquivo válido. Use os JSON baixados por esta página."); return; }
+    render();
+    toast(`${bons} arquivo(s) unidos: ${fu} follow-up(s), ${sol} oportunidade(s), ${vis} visita(s)`
+          + (emp ? `, ${emp} empresa(s) nova(s)` : "")
+          + (ruins ? ` · ${ruins} ignorado(s)` : ""));
+  });
 };
+carregarFila();
 render();
+pintarSync();
+
+/* Primeira vez que este aparelho abre a página já sincronizada: sobe
+   sozinho o que foi lançado antes, para nada ficar preso no celular. */
+if(ligado()){
+  let jaSubiu = false;
+  try{ jaSubiu = localStorage.getItem(KEY + ".hist") === "1"; }catch(e){}
+  if(!jaSubiu){
+    const n = enviarHistorico();
+    try{ localStorage.setItem(KEY + ".hist", "1"); }catch(e){}
+    if(n) setTimeout(()=>toast(n + " lançamento(s) anteriores enviados ao servidor"), 900);
+  }
+}
+
+if(ligado()){
+  ligarTempoReal();
+  puxar();
+}
+enviar();
+setInterval(enviar, 15000);
+/* Consulta de reforço: mantém todo mundo alinhado mesmo se o canal de
+   tempo real cair, o que acontece com facilidade no wi-fi de pavilhão. */
+setInterval(()=>{ if(ligado()) puxar(); }, tempoReal ? 15000 : 5000);
+/* Se a pessoa estava digitando quando chegou novidade, aplica ao terminar. */
+setInterval(()=>{ if(pendenteRender) aplicar(); }, 2000);
+window.addEventListener("online", enviar);
+window.addEventListener("offline", ()=>{ if(ligado()){ syncEstado="offline"; pintarSync(); } });
+window.addEventListener("beforeunload", ev=>{
+  if(fila.length){ ev.preventDefault(); ev.returnValue = ""; }
+});
 </script>
 </body>
 </html>
